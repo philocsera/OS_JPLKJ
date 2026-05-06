@@ -1,4 +1,4 @@
-# Kgent 기반 검증 심층구조 설계
+# Kgent 기반 검증강화 설계
 
 > **주제:** Kgent 논문을 기반으로 한 eBPF 코드 생성·검증 구조 분석과, 검증 이후 성능 평가 및 반복 최적화까지 포함하는 심층 구조 설계  
 > **핵심 키워드:** Kgent, eBPF, LLM, Symbolic Verifier, eBPF Verifier, Hoare Logic, Checkpoint, Score, Optimize, Rollback  
