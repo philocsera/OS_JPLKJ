@@ -1,0 +1,594 @@
+# LLM 기반 xv6 메모리 진단·완화 Agent Pipeline
+
+## 1. 프로젝트 개요
+
+이번 프로젝트에서 준비한 것은 **LLM 기반 xv6 메모리 진단·완화 Agent Pipeline**이다.
+
+이 구조는 xv6 운영체제에서 발생할 수 있는 메모리 부족, page fault 증가, 특정 프로세스의 메모리 독점 같은 문제를 관찰하고, LLM이 그 원인을 진단한 뒤, 즉시 적용 가능한 **runtime policy**를 제안하고, 실제 workload 실험을 통해 효과를 확인하는 구조를 가진다.
+
+이번 버전에서는 실제 커널 코드를 LLM이 생성하거나 수정하는 방향은 고려하지 않는다. 따라서 **Patch Candidate**, **Hard Verifier**, **Checkpoint/Rollback 기반 코드 적용 구조**는 현재 구현 범위에서 제외한다.
+
+대신 핵심은 다음과 같다.
+
+```text
+커널은 가볍게 상태를 제공한다.
+memhint는 user-level에서 상태를 수집한다.
+bridge는 LLM 호출 여부를 결정한다.
+LLM agent는 diagnosis와 hypothesis를 생성한다.
+필요하면 runtime policy를 제안한다.
+workload 실험으로 적용 전후를 비교한다.
+score를 통해 효과를 판단한다.
+```
+
+즉, 이 프로젝트는 LLM이 운영체제 코드를 직접 고치는 구조가 아니라, **xv6의 메모리 상태를 관찰하고 문제 원인을 진단한 뒤, 제한된 정책을 통해 완화하고 실험적으로 검증하는 구조**이다.
+
+---
+
+## 2. 전체 구조 요약
+
+```text
+[1] Kernel Sensor
+    메모리 관련 이상 징후를 가볍게 감지
+
+        ↓
+
+[2] Syscall 기반 정보 제공
+    getmemstat, proclist 등을 통해 커널 상태를 user-level로 전달
+
+        ↓
+
+[3] memhint
+    user-level에서 커널 상태를 주기적으로 수집
+
+        ↓
+
+[4] Bridge
+    LLM agent를 호출할지 판단하는 gatekeeper 역할
+
+        ↓
+
+[5] LLM Agent
+    diagnosis 생성
+    hypothesis 생성
+    필요 시 runtime policy 생성
+
+        ↓
+
+[6] Policy Guard
+    제안된 정책이 허용된 범위 안에 있는지 검사
+
+        ↓
+
+[7] Runtime Policy 적용
+    setmemquota 등 제한된 syscall을 통해 정책 적용
+
+        ↓
+
+[8] Workload 실행
+    메모리 workload를 실행하여 적용 전후 비교
+
+        ↓
+
+[9] Score 비교
+    메모리 상태, page fault, kalloc 실패, 실행 시간 등을 수치화
+
+        ↓
+
+[10] 결과 보고 및 Feedback 저장
+    개선 여부를 기록하고 이후 판단에 활용
+```
+
+---
+
+## 3. 핵심 설계 방향
+
+이 프로젝트에서 가장 중요하게 고려한 부분은 **커널 상태를 어떻게 수집할 것인가**이다.
+
+LLM을 커널 내부에 직접 넣는 방식은 운영체제에 큰 부담을 줄 수 있다. 따라서 최종적으로 다음과 같은 방향으로 구조를 잡는다.
+
+```text
+커널은 최소한의 정보만 제공한다.
+실제 판단은 user-level agent가 비동기적으로 수행한다.
+```
+
+즉, 커널은 무거운 판단을 하지 않고, 메모리 문제와 관련된 최소한의 상태만 감지한다. 이후 user-level에서 동작하는 agent가 해당 정보를 수집하고, bridge가 LLM agent 호출 여부를 판단한다.
+
+이 접근의 장점은 다음과 같다.
+
+- 커널 안에 LLM을 넣지 않기 때문에 OS 부담이 줄어든다.
+- 커널은 가벼운 감지만 수행하므로 안정성을 유지할 수 있다.
+- user-level agent가 비동기적으로 분석하므로 시스템 흐름을 크게 방해하지 않는다.
+- 필요한 경우에만 LLM을 호출하므로 비용과 오버헤드를 줄일 수 있다.
+- 실제 코드 수정 없이도 runtime policy 중심의 실험이 가능하다.
+
+---
+
+## 4. 구현해야 할 주요 syscall
+
+기존 xv6에는 메모리 상태를 관찰하고 제어하기 위한 기능이 충분하지 않기 때문에, 프로젝트에서는 다음 syscall을 중심으로 구현을 고려한다.
+
+```text
+getmemstat
+setmemquota
+swapout
+```
+
+다만 현재 구현의 중심은 `getmemstat`과 `setmemquota`이다. `swapout`은 구현 난도가 높기 때문에 선택 구현 또는 설계 분석 대상으로 둔다.
+
+---
+
+## 4.1 getmemstat
+
+`getmemstat`은 현재 커널의 메모리 상태를 user-level agent가 확인할 수 있도록 정보를 제공하는 syscall이다.
+
+수집 대상은 다음과 같다.
+
+- total memory
+- free memory
+- swap total
+- swap used
+- kalloc 실패 횟수
+- page fault 횟수
+- 프로세스별 메모리 사용량
+- 필요 시 메모리 관련 trace 정보
+
+예시는 다음과 같다.
+
+```text
+total=134217728 free=52428800 swap_total=0 swap_used=0
+pid name state sz priority
+1 init SLEEPING 16384 10
+2 sh RUNNING 32768 10
+3 memstress RUNNABLE 8388608 10
+<<MEM_END>>
+```
+
+이 정보는 이후 memhint와 bridge를 거쳐 LLM agent의 입력으로 사용된다.
+
+---
+
+## 4.2 setmemquota
+
+`setmemquota`는 특정 프로세스가 사용할 수 있는 메모리 상한을 설정하는 syscall이다.
+
+예를 들어 어떤 프로세스가 메모리를 과도하게 사용하고 있다면, LLM은 해당 프로세스에 quota를 적용하는 runtime policy를 제안할 수 있다.
+
+```text
+예시 정책:
+특정 pid의 메모리 사용량이 기준치를 초과하면
+setmemquota(pid, limit)를 통해 메모리 증가량을 제한한다.
+```
+
+이 방식은 커널 구조 자체를 크게 수정하지 않고도, 특정 프로세스의 메모리 독점 문제를 완화할 수 있다는 장점이 있다.
+
+---
+
+## 4.3 swapout
+
+`swapout`은 특정 프로세스의 일부 page를 swap 영역으로 내보내는 syscall이다.
+
+```text
+swapout(pid)
+```
+
+이 syscall은 메모리 부족 상황에서 일부 page를 swap 영역으로 이동시켜 물리 메모리를 확보하는 역할을 한다.
+
+다만 swap 구현은 난도가 높기 때문에, 프로젝트의 위험 구간으로 분류한다.
+
+따라서 일정 내에 안정적인 swap 구현이 어렵다면 다음과 같은 비상 계획을 둔다.
+
+```text
+Plan A:
+getmemstat + setmemquota + workload 검증 중심 구현
+
+Plan B:
+swapout은 제한적 prototype 또는 설계 분석 수준으로 축소
+
+Plan C:
+최종 결과는 quota 기반 runtime policy와 실험 결과 중심으로 완성
+```
+
+즉, swap은 가능하면 구현하되, 전체 프로젝트의 완성도를 해치지 않도록 위험도를 조절한다.
+
+---
+
+## 5. memhint 구조
+
+`memhint`는 user-level에서 동작하는 메모리 agent이다.
+
+역할은 `getmemstat`과 `proclist`를 호출하여 커널 상태를 주기적으로 수집하고, 이를 bridge에 전달하는 것이다.
+
+```text
+[Kernel]
+   ↓ getmemstat / proclist
+[memhint]
+   ↓ memory status block
+[Bridge]
+   ↓ 필요 시 LLM 호출
+[LLM Agent]
+```
+
+예를 들어 memhint는 다음과 같은 정보를 수집한다.
+
+```text
+total=134217728 free=52428800 swap_total=0 swap_used=0
+pid name state sz priority
+1 init SLEEPING 16384 10
+2 sh RUNNING 32768 10
+3 memstress RUNNABLE 8388608 10
+<<MEM_END>>
+```
+
+이 정보는 단순 로그가 아니라, LLM agent가 현재 시스템 상태를 분석하기 위한 context가 된다.
+
+---
+
+## 6. Bridge의 역할
+
+Bridge는 memhint가 수집한 정보를 보고 **LLM agent를 호출할지 말지 결정하는 gatekeeper** 역할을 한다.
+
+Bridge가 판단하는 질문은 다음과 같다.
+
+```text
+이 이벤트가 정말 분석할 만한 문제인가?
+너무 자주 발생하는 이벤트는 아닌가?
+LLM을 호출할 만큼 심각한가?
+필요한 trace/context가 충분히 모였는가?
+프로세스 동작이 끝났거나 분석 가능한 시점인가?
+```
+
+즉, bridge는 모든 이벤트마다 LLM을 호출하지 않는다.
+
+LLM 호출 조건을 만족하는 경우에만 정보를 정리하여 LLM agent로 넘긴다.
+
+이렇게 하면 다음과 같은 효과가 있다.
+
+- 불필요한 LLM 호출 감소
+- 시스템 오버헤드 감소
+- 분석이 필요한 이벤트만 선별
+- 커널과 LLM 사이의 분리 유지
+
+---
+
+## 7. LLM Agent의 역할
+
+LLM agent는 bridge로부터 전달받은 정보를 바탕으로 다음 역할을 수행한다.
+
+```text
+Diagnosis 생성
+Hypothesis 생성
+필요 시 Runtime Policy 생성
+```
+
+이번 프로젝트에서는 LLM이 patch candidate를 생성하지 않는다. 즉, LLM은 커널 코드를 수정하는 역할이 아니라, **상태 분석과 정책 제안 역할**을 맡는다.
+
+---
+
+## 7.1 Diagnosis
+
+Diagnosis는 단순히 “메모리 문제가 있다”라고 말하는 단계가 아니다.
+
+현재 관찰된 증상을 바탕으로 문제가 어떤 유형에 가까운지 분류하고, 그 근거를 붙이는 단계이다.
+
+분류할 수 있는 문제 유형은 다음과 같다.
+
+- memory leak
+- memory pressure
+- fragmentation
+- page fault 증가 문제
+- swap thrashing
+- 특정 syscall 경로 문제
+- 특정 프로세스의 메모리 독점
+
+예시는 다음과 같다.
+
+```text
+Diagnosis:
+현재 시스템은 단순한 일시적 메모리 사용 증가가 아니라,
+특정 프로세스의 반복적인 메모리 할당으로 인해
+memory pressure가 발생한 상태로 판단된다.
+
+근거:
+1. free memory가 지속적으로 감소한다.
+2. memstress 프로세스의 sz 값이 비정상적으로 크다.
+3. kalloc 실패 또는 page fault 증가가 함께 관찰된다.
+```
+
+---
+
+## 7.2 Hypothesis
+
+Diagnosis가 현재 문제의 설명이라면, hypothesis는 **검증 가능한 원인 후보**이다.
+
+즉, LLM은 현재 증상을 보고 가능한 원인을 여러 개의 가설로 만든다.
+
+예시는 다음과 같다.
+
+```text
+Hypothesis 1:
+특정 프로세스가 sbrk()를 반복 호출하면서
+free memory가 급격히 감소하고 있을 수 있다.
+
+Hypothesis 2:
+프로세스 종료 이후 메모리 회수량이 충분하지 않아
+일부 page가 정상적으로 반환되지 않았을 가능성이 있다.
+
+Hypothesis 3:
+fork 이후 child process 종료 과정에서
+메모리 사용량이 예상보다 늦게 회복되고 있을 수 있다.
+```
+
+이 단계의 핵심은 문제를 추상적으로 말하는 것이 아니라, 이후 workload 실험으로 검증할 수 있는 형태로 바꾸는 것이다.
+
+---
+
+## 7.3 Runtime Policy Candidate
+
+Diagnosis와 hypothesis 다음에는 patch를 생성하지 않는다.
+
+그 대신 **Runtime Policy Candidate**를 생성한다.
+
+Runtime Policy Candidate는 현재 문제에 대해 실행 중인 시스템에서 비교적 안전하게 적용할 수 있는 완화 정책이다.
+
+예시는 다음과 같다.
+
+```text
+Runtime Policy Candidate 1:
+해당 프로세스의 메모리 증가량을 제한한다.
+
+Runtime Policy Candidate 2:
+free page가 일정 기준 이하로 떨어지면
+메모리 사용량이 큰 프로세스를 관찰 대상으로 표시한다.
+
+Runtime Policy Candidate 3:
+page fault가 급증한 프로세스를 기록하고,
+필요하면 quota 적용 대상으로 분류한다.
+
+Runtime Policy Candidate 4:
+메모리 사용량이 급증한 프로세스에 대해
+setmemquota(pid, limit)를 적용한다.
+```
+
+Runtime Policy는 커널 구조 자체를 바꾸는 것이 아니라, 이미 준비된 제한된 syscall과 정책 중 하나를 선택하는 방식이다.
+
+따라서 실제 코드 생성을 동반하는 patch 방식보다 현재 프로젝트에 더 적합하다.
+
+---
+
+## 8. Policy Guard
+
+이번 프로젝트에서는 Hard Verifier를 구현하지 않는다.
+
+대신 runtime policy가 잘못 적용되는 것을 막기 위해, 간단한 **Policy Guard**를 둔다.
+
+Policy Guard는 코드 안전성을 검증하는 단계가 아니라, LLM이 제안한 정책이 미리 정한 허용 범위 안에 있는지 검사하는 단계이다.
+
+예시는 다음과 같다.
+
+```text
+검사 항목:
+1. 존재하는 pid인지 확인한다.
+2. quota 값이 너무 작거나 비정상적으로 크지 않은지 확인한다.
+3. init, sh 같은 핵심 프로세스에는 위험한 정책을 적용하지 않는다.
+4. 같은 pid에 너무 자주 quota를 변경하지 않는다.
+5. free memory 기준이 너무 민감하게 설정되지 않았는지 확인한다.
+```
+
+즉, Policy Guard는 LLM이 제안한 runtime policy를 그대로 실행하지 않고, 최소한의 안전 범위 안에서만 실행되도록 제한하는 역할을 한다.
+
+---
+
+## 9. Runtime Policy 적용
+
+Policy Guard를 통과한 정책은 제한된 syscall을 통해 적용한다.
+
+대표적인 적용 방식은 다음과 같다.
+
+```text
+setmemquota(pid, limit)
+```
+
+예를 들어 memstress 프로세스가 과도하게 메모리를 사용하고 있다면 다음과 같은 흐름이 가능하다.
+
+```text
+[관찰]
+memstress 프로세스의 sz 값이 급격히 증가
+free memory가 기준치 이하로 감소
+
+[LLM 판단]
+memory pressure 가능성 높음
+memstress가 주요 원인 후보
+
+[정책 제안]
+setmemquota(memstress_pid, 8MB)
+
+[Policy Guard]
+pid 존재 여부 확인
+quota 값 범위 확인
+핵심 프로세스 여부 확인
+
+[적용]
+setmemquota 호출
+```
+
+이 방식은 커널 코드를 새로 생성하거나 수정하지 않고도, 특정 상황에 대한 완화 정책을 실험할 수 있다.
+
+---
+
+## 10. Workload 실행
+
+Workload 실행은 실제 실험 단계이다.
+
+LLM이 제안한 runtime policy가 실제로 효과가 있는지 확인하기 위해, 적용 전후에 동일한 workload를 실행한다.
+
+예시 workload는 다음과 같다.
+
+```text
+- sbrk 반복 호출 workload
+- fork 이후 exit 반복 workload
+- 큰 메모리 할당 후 해제 workload
+- page fault 유도 workload
+- 여러 프로세스의 동시 메모리 사용 workload
+- memstress workload
+```
+
+이 단계의 목적은 단순히 “좋아 보이는 정책”을 적용하는 것이 아니라, 실제 수치로 개선 여부를 확인하는 것이다.
+
+---
+
+## 11. Score 비교
+
+Workload 실행 이후에는 적용 전과 후의 결과를 비교하여 score를 계산한다.
+
+메모리 관리에서 사용할 수 있는 기준은 다음과 같다.
+
+```text
+- free memory 회복률
+- kalloc 실패 횟수
+- page fault 횟수
+- 특정 프로세스의 메모리 독점 완화 정도
+- workload 실행 시간
+- runtime overhead
+- 시스템 안정성 여부
+```
+
+예시는 다음과 같다.
+
+```text
+적용 전:
+free memory = 50MB
+kalloc_fail = 10
+page_fault = 500
+score = 62
+
+적용 후:
+free memory = 70MB
+kalloc_fail = 2
+page_fault = 300
+score = 78
+```
+
+점수가 개선되면 해당 runtime policy가 효과가 있었다고 판단하고, 개선되지 않으면 해당 정책을 실패 사례로 기록한다.
+
+현재 프로젝트에서는 코드 패치를 적용하지 않으므로, rollback이라는 복잡한 구조보다는 다음과 같은 방식이 더 적합하다.
+
+```text
+개선됨:
+정책 성공 사례로 기록
+
+개선되지 않음:
+정책 실패 사례로 기록
+필요하면 quota 해제 또는 기본 상태로 복귀
+```
+
+---
+
+## 12. 결과 보고 및 Feedback 저장
+
+마지막 단계에서는 diagnosis, hypothesis, runtime policy, workload 결과, score를 저장한다.
+
+예시는 다음과 같다.
+
+```text
+Diagnosis:
+memory pressure
+
+Hypothesis:
+memstress 프로세스의 반복적인 sbrk 호출로 인해 free memory 감소
+
+Runtime Policy:
+setmemquota(pid=3, limit=8MB)
+
+Result:
+free memory 회복
+kalloc_fail 감소
+page_fault 감소
+score 62 → 78
+
+Decision:
+성공 사례로 저장
+```
+
+이 기록은 다음 분석에서 유사한 문제가 발생했을 때 참고할 수 있다.
+
+즉, 시스템은 매번 처음부터 판단하는 것이 아니라, 이전 실험 결과를 바탕으로 더 나은 정책을 선택할 수 있다.
+
+---
+
+## 13. 현재 구현 범위에서 제외하는 항목
+
+이번 버전에서는 다음 항목을 구현 범위에서 제외한다.
+
+```text
+1. Patch Candidate 생성
+2. LLM 기반 커널 코드 수정
+3. Hard Verifier
+4. Checkpoint 기반 코드 rollback
+5. 자동 patch 적용 구조
+```
+
+이 항목들은 원래 LLM이 코드를 생성하거나 수정하는 확장 구조에서 필요한 기능이다.
+
+하지만 현재 프로젝트는 runtime policy 중심이므로, 위 기능들은 필수 요소가 아니다.
+
+따라서 현재 구조에서는 다음과 같이 단순화한다.
+
+```text
+기존 확장 구조:
+Diagnosis → Hypothesis → Patch Candidate → Hard Verifier → Workload → Score → Rollback/Accept
+
+현재 구현 구조:
+Diagnosis → Hypothesis → Runtime Policy → Policy Guard → Workload → Score → Result Feedback
+```
+
+---
+
+## 14. 현재 논의가 필요한 부분
+
+아직 구체적으로 더 논의해야 할 부분은 다음과 같다.
+
+```text
+1. getmemstat에서 어떤 정보를 반드시 수집할 것인가?
+2. setmemquota의 quota 기준을 어떻게 정할 것인가?
+3. LLM 호출 조건을 bridge에서 어떻게 설정할 것인가?
+4. swapout을 실제 구현할 것인가, 설계 분석으로 축소할 것인가?
+5. workload를 어떤 기준으로 구성할 것인가?
+6. score 기준을 고정할 것인가, LLM이 일부 가중치를 추천하게 할 것인가?
+7. Policy Guard의 제한 조건을 어디까지 둘 것인가?
+```
+
+특히 score pipeline은 중요한 논의 대상이다.
+
+기준을 사람이 미리 고정하면 안정적이지만 유연성이 떨어질 수 있다. 반대로 LLM이 매번 가중치를 정하게 하면 유연하지만 결과의 일관성이 낮아질 수 있다.
+
+따라서 현재로서는 다음과 같은 절충안이 적절하다.
+
+```text
+기본 score 기준은 사람이 고정한다.
+LLM은 diagnosis에 따라 어떤 지표를 중요하게 볼지 추천한다.
+최종 성공 여부는 고정된 기준과 workload 결과를 기반으로 판단한다.
+```
+
+---
+
+## 15. 최종 정리
+
+이 프로젝트의 핵심은 다음과 같다.
+
+```text
+커널은 가볍게 감지한다.
+memhint는 user-level에서 상태를 수집한다.
+bridge는 LLM 호출 여부를 결정한다.
+LLM agent는 diagnosis와 hypothesis를 생성한다.
+필요하면 runtime policy를 제안한다.
+Policy Guard는 정책 적용 범위를 제한한다.
+workload는 정책 적용 전후를 실험한다.
+score는 실제 개선 여부를 수치로 판단한다.
+결과는 feedback으로 저장한다.
+```
+
+즉, 이 구조는 단순히 LLM이 운영체제를 수정하는 시스템이 아니다.
+
+LLM은 문제를 분석하고 runtime policy를 제안하는 역할을 맡고, 실제 효과는 workload와 score 비교를 통해 판단된다.
+
+최종적으로 이 프로젝트는 **xv6에서 메모리 문제를 관찰하고, LLM이 원인을 진단하며, 제한된 runtime policy를 통해 완화하고, 실험 결과로 효과를 검증하는 user-level agent pipeline**이라고 정리할 수 있다.
